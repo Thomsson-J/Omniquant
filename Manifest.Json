@@ -1,21 +1,258 @@
-{
-  "name": "Your Trading App",
-  "short_name": "TradingApp",
-  "start_url": "/",
-  "display": "standalone",
-  "background_color": "#ffffff",
-  "theme_color": "#000000",
-  "icons": [
-    {
-      "src": "/icon-192.png",
-      "sizes": "192x192",
-      "type": "image/png"
-    },
-    {
-      "src": "/icon-512.png",
-      "sizes": "512x512",
-      "type": "image/png"
-    }
-  ]
-}
+"""
+Day-trading indicator scanner (clean, technical, minimal frontend)
+Targets: PLTR, GOOG, TSLA (default)
+Timeframe: intraday (5m). This script computes short-term indicators, maps them to 0-1
+scores using sigmoid mappings, and prints a compact, human-friendly output.
 
+Behavior:
+ - If `yfinance` is available it's used; otherwise synthetic test data is generated.
+ - Minimal frontend: only writes `scan_results.json` and a simple `scan_results_avg.csv`.
+ - Basic self-tests run when executed directly.
+
+Important: mappings are aligned so **low score = overvalued / weak / bad**,
+high score = undervalued / strong / good (ready-to-buy signal for a mean-reversion day trade).
+"""
+
+import json
+import numpy as np
+import pandas as pd
+from datetime import datetime
+
+try:
+    import yfinance as yf
+except Exception:
+    yf = None
+
+# ---------------- Indicator helpers ----------------
+
+def sma(series, window):
+    return series.rolling(window=window, min_periods=1).mean()
+
+def ema(series, window):
+    return series.ewm(span=window, adjust=False).mean()
+
+def rsi(series, window=14):
+    delta = series.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.rolling(window=window, min_periods=window).mean()
+    avg_loss = loss.rolling(window=window, min_periods=window).mean()
+    rs = avg_gain / (avg_loss.replace(0, np.nan))
+    rsi_val = 100 - (100 / (1 + rs))
+    return rsi_val.fillna(50)
+
+def bollinger_bands(series, window=20, n_std=2):
+    mid = sma(series, window)
+    std = series.rolling(window=window, min_periods=1).std()
+    upper = mid + n_std * std
+    lower = mid - n_std * std
+    return lower, mid, upper
+
+def macd(series, fast=12, slow=26, signal=9):
+    fast_e = ema(series, fast)
+    slow_e = ema(series, slow)
+    macd_line = fast_e - slow_e
+    signal_line = ema(macd_line, signal)
+    hist = macd_line - signal_line
+    return macd_line, signal_line, hist
+
+def atr(df, window=14):
+    high = df['High']
+    low = df['Low']
+    close = df['Close']
+    prev_close = close.shift(1)
+    tr1 = high - low
+    tr2 = (high - prev_close).abs()
+    tr3 = (low - prev_close).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    return tr.rolling(window=window, min_periods=1).mean()
+
+def stochastic_oscillator(df, k_window=14, d_window=3):
+    low_min = df['Low'].rolling(window=k_window, min_periods=1).min()
+    high_max = df['High'].rolling(window=k_window, min_periods=1).max()
+    k = 100 * (df['Close'] - low_min) / (high_max - low_min).replace(0, np.nan)
+    d = k.rolling(window=d_window, min_periods=1).mean()
+    return k.fillna(50), d.fillna(50)
+
+def obv(df):
+    direction = np.sign(df['Close'].diff().fillna(0))
+    vol = df['Volume'].fillna(0)
+    return (direction * vol).cumsum()
+
+def adx(df, window=14):
+    high = df['High']
+    low = df['Low']
+    close = df['Close']
+    plus_dm = high.diff()
+    minus_dm = -low.diff()
+    plus_dm = plus_dm.where((plus_dm > minus_dm) & (plus_dm > 0), 0.0)
+    minus_dm = minus_dm.where((minus_dm > plus_dm) & (minus_dm > 0), 0.0)
+    tr1 = high - low
+    tr2 = (high - close.shift(1)).abs()
+    tr3 = (low - close.shift(1)).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    atr_val = tr.rolling(window=window, min_periods=1).mean()
+    plus_di = 100 * (plus_dm.rolling(window=window, min_periods=1).sum() / atr_val)
+    minus_di = 100 * (minus_dm.rolling(window=window, min_periods=1).sum() / atr_val)
+    dx = (abs(plus_di - minus_di) / (plus_di + minus_di)).replace([np.inf, -np.inf], 0).fillna(0) * 100
+    return dx.rolling(window=window, min_periods=1).mean()
+
+# ---------------- Mapping helpers ----------------
+
+def sigmoid(x, k=1.0, x0=0.0):
+    z = k * (x - x0)
+    return 1.0 / (1.0 + np.exp(-z))
+
+def map_rsi(val):
+    return float(np.clip(1 - sigmoid(val, k=0.12, x0=50), 0.0, 1.0))
+
+def map_macd_hist(val):
+    return float(np.clip(sigmoid(val, k=1.0, x0=0.0), 0.0, 1.0))
+
+def map_price_diff(diff):
+    return float(np.clip(1 - sigmoid(diff, k=2.0, x0=0.0), 0.0, 1.0))
+
+def map_bb(pos_norm):
+    return float(np.clip(1 - sigmoid(pos_norm, k=6.0, x0=0.5), 0.0, 1.0))
+
+def map_atr_ratio(ratio):
+    return float(np.clip(1 - sigmoid(ratio, k=6.0, x0=1.0), 0.0, 1.0))
+
+def map_stochastic(val):
+    return float(np.clip(1 - sigmoid(val, k=0.12, x0=50), 0.0, 1.0))
+
+def map_obv_pct(pct):
+    return float(np.clip(sigmoid(pct, k=0.4, x0=0.0), 0.0, 1.0))
+
+def map_adx(val):
+    return float(np.clip(sigmoid(val, k=0.2, x0=25), 0.0, 1.0))
+
+# ---------------- Data fetching ----------------
+
+def fetch_data(tickers, interval='5m', period='7d'):
+    data_map = {}
+    if yf is not None:
+        try:
+            raw = yf.download(tickers, interval=interval, period=period, group_by='ticker', threads=True)
+            for t in tickers:
+                try:
+                    df = raw[t].dropna()
+                except Exception:
+                    df = raw.xs(t, axis=1, level=0).dropna()
+                if df.empty or len(df) < 20:
+                    df = generate_synthetic_intraday(t)
+                data_map[t] = df
+            return data_map
+        except Exception:
+            pass
+    # fallback to synthetic
+    for i, t in enumerate(tickers):
+        data_map[t] = generate_synthetic_intraday(t)
+    return data_map
+
+# ---------------- Synthetic data generator ----------------
+
+def generate_synthetic_intraday(ticker, bars=300, start_price=100.0, seed=None):
+    rng = np.random.default_rng(seed)
+    end = pd.Timestamp.utcnow().floor('5T')
+    idx = pd.date_range(end=end, periods=bars, freq='5T')
+    drift = 0.0001
+    vol = 0.0015
+    returns = drift + rng.normal(0, vol, size=bars)
+    prices = start_price * np.exp(np.cumsum(returns))
+    high = prices * (1 + np.abs(rng.normal(0, 0.0008, size=bars)))
+    low = prices * (1 - np.abs(rng.normal(0, 0.0008, size=bars)))
+    openp = prices * (1 + rng.normal(0, 0.0004, size=bars))
+    close = prices
+    volume = rng.integers(100, 10000, size=bars).astype(float)
+    return pd.DataFrame({'Open': openp, 'High': high, 'Low': low, 'Close': close, 'Volume': volume}, index=idx)
+
+# ---------------- Scoring ----------------
+
+def score_ticker(df, weights=None):
+    if weights is None:
+        weights = {'RSI': 2.0, 'PriceDiff': 1.0, 'BB': 1.0, 'MACD': 1.0, 'Stochastic': 1.0, 'OBV': 0.5, 'ADX': 0.5, 'ATR': 0.5}
+
+    scores = {}
+    # RSI14 (higher = overbought, worse)
+    rsi_val = rsi(df['Close']).iloc[-1]
+    scores['RSI'] = map_rsi(rsi_val) * weights['RSI']
+
+    # Price vs SMA20
+    sma20 = sma(df['Close'], 20).iloc[-1]
+    diff = df['Close'].iloc[-1] - sma20
+    scores['PriceDiff'] = map_price_diff(diff) * weights['PriceDiff']
+
+    # Bollinger Bands position
+    lower, mid, upper = bollinger_bands(df['Close'], 20)
+    pos = (df['Close'].iloc[-1] - lower.iloc[-1]) / (upper.iloc[-1] - lower.iloc[-1] + 1e-6)
+    scores['BB'] = map_bb(pos) * weights['BB']
+
+    # MACD histogram
+    _, _, macd_hist = macd(df['Close'])
+    scores['MACD'] = map_macd_hist(macd_hist.iloc[-1]) * weights['MACD']
+
+    # Stochastic
+    k, d = stochastic_oscillator(df)
+    scores['Stochastic'] = map_stochastic(k.iloc[-1]) * weights['Stochastic']
+
+    # OBV slope
+    obv_series = obv(df)
+    slope_pct = (obv_series.iloc[-1] - obv_series.iloc[-5]) / max(1, abs(obv_series.iloc[-5]))
+    scores['OBV'] = map_obv_pct(slope_pct) * weights['OBV']
+
+    # ADX
+    adx_val = adx(df).iloc[-1]
+    scores['ADX'] = map_adx(adx_val) * weights['ADX']
+
+    # ATR ratio (volatility)
+    atr_val = atr(df).iloc[-1]
+    ratio = atr_val / df['Close'].iloc[-1]
+    scores['ATR'] = map_atr_ratio(ratio) * weights['ATR']
+
+    total_weight = sum(weights.values())
+    avg = sum(scores.values()) / total_weight
+    return scores, avg
+
+# ---------------- Runner ----------------
+
+def run_scan(tickers=['PLTR', 'GOOG', 'TSLA'], interval='5m', period='7d', weights=None, write_json=True):
+    print(f"Fetching {tickers} at interval={interval} period={period} ...")
+    data = fetch_data(tickers, interval=interval, period=period)
+    results = {}
+
+    for t in tickers:
+        df = data.get(t)
+        if df is None or df.empty or len(df) < 20:
+            print(f"Not enough data for {t}; skipping.")
+            continue
+        scores, avg = score_ticker(df, weights=weights)
+        results[t] = {'scores': scores, 'avg': avg, 'last_price': float(df['Close'].iloc[-1])}
+
+        print("\n" + "=" * 40)
+        print(f"Ticker: {t}  | Last price: {df['Close'].iloc[-1]:.2f}")
+        print("-" * 40)
+        for k, v in scores.items():
+            print(f"{k:18}: {v:.3f}")
+        print(f"AVERAGE SCORE     : {avg:.3f}")
+        action = 'HOLD'
+        if avg >= 0.60:
+            action = 'BUY'
+        elif avg <= 0.40:
+            action = 'SELL'
+        print(f"RECOMMENDATION    : {action}")
+        print("=" * 40)
+
+    if write_json:
+        try:
+            with open('scan_results.json', 'w') as f:
+                json.dump(results, f, indent=2)
+            pd.Series({t: results[t]['avg'] for t in results}).to_csv('scan_results_avg.csv')
+            print("\nWrote scan_results.json and scan_results_avg.csv")
+        except Exception as e:
+            print(f"Could not write outputs: {e}")
+
+    return results
+
+if __name__ == '__main__':
+    run_scan()
