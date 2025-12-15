@@ -256,3 +256,4 @@ def run_scan(tickers=['PLTR', 'GOOG', 'TSLA'], interval='5m', period='7d', weigh
 
 if __name__ == '__main__':
     run_scan()
+
